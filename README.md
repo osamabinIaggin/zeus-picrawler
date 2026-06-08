@@ -6,6 +6,14 @@ I built this on my own PiCrawler and figured anyone with the same kit — or bui
 
 Quick heads up before you dig in: the hardware libraries (`picrawler`, `robot_hat`, `vilib`, `sunfounder-controller`) are SunFounder's, not mine, so they aren't in this repo. You grab those from SunFounder (link down in [Setup](#setup)). Everything here is my own code.
 
+## See it
+
+Demo clips are on the way — waving, push-ups, and the slightly-too-attentive face-tracking head swivel. They'll live in [`media/`](media/), which already has a two-command guide for pulling footage off the Pi and turning it into a GIF.
+
+<!-- Once clips are in media/, uncomment and rename: -->
+<!-- ![Zeus waving hello](media/wave.gif) -->
+<!-- ![Push-ups, unprompted](media/pushup.gif) -->
+
 ## What it actually does
 
 - **Listens offline.** Vosk handles the speech-to-text, so it's always half-listening for `computer`, `spider`, `zeus`, or `picrawler`. Nothing gets shipped off to some server to figure out what you said.

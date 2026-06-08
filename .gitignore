@@ -16,6 +16,13 @@ vosk-model-*/
 *.jpeg
 *.png
 *.wav
+*.gif
+
+# ...but keep curated demo media in media/
+!media/
+!media/*.jpg
+!media/*.png
+!media/*.gif
 
 # Runtime flag files
 .zeus_no_move
