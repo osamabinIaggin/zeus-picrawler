@@ -1,40 +1,36 @@
 # Tests & self-checks
 
-Hardware and pipeline diagnostics. Most need real hardware. **Always stop the
-`zeus` service first** (`sudo systemctl stop zeus`) so the test is the sole owner
-of the servos, camera, and mic.
+Hardware and pipeline diagnostics. Most of these need the real robot. Stop the
+service first (`sudo systemctl stop zeus`) so the test is the only thing talking
+to the servos, camera, and mic.
 
-> 🛡️ **Power safety:** the PiCrawler can brown out the Pi 5 when many servos move
-> at once. `test_actions_safe.py` checks `vcgencmd` voltage/throttle before and
-> after every move and **aborts** on a brownout. Run motion tests with the robot
-> on a stand and a strong power supply.
+A warning that's worth repeating: the PiCrawler can brown out the Pi 5 when a
+bunch of servos move at once. `test_actions_safe.py` checks the voltage and
+throttle state before and after every move and stops if it sees a brownout. Run
+motion tests with the robot on a stand and a power supply that means it.
 
 ## Movement / hardware
 
-| File | Purpose |
-|------|---------|
-| [`test_actions_safe.py`](test_actions_safe.py) | Brownout-gated run of first-wake wave + every action-with-response. Requires `~/.zeus_no_move` removed. The safest motion test to start with. |
-| [`test_movements.py`](test_movements.py) | Walks every gait + preset action with labels and pauses — quick check after a hardware change. |
-| [`test_face_track.py`](test_face_track.py) | Camera + face-tracking servo loop. |
-| [`test_yaw.py`](test_yaw.py) | Minimal yaw-servo sanity check. |
+- **[`test_actions_safe.py`](test_actions_safe.py)** — brownout-gated run of the first-wake wave plus every action-with-response. Needs `~/.zeus_no_move` removed. Start here for motion.
+- **[`test_movements.py`](test_movements.py)** — walks every gait and preset action with labels and pauses. Good after you've changed something physical.
+- **[`test_face_track.py`](test_face_track.py)** — the camera + face-tracking head loop.
+- **[`test_yaw.py`](test_yaw.py)** — minimal yaw-servo sanity check.
 
-## Audio / STT / LLM pipeline (no human needed)
+## Audio / STT / LLM (no human required)
 
-| File | Purpose |
-|------|---------|
-| [`audio_selftest.py`](audio_selftest.py) | Measures ambient noise floor, then acoustic loopback: plays a known phrase, records it, transcribes it. |
-| [`cmd_capture_test.py`](cmd_capture_test.py) | Validates the VAD command-capture + transcription path without a wake word. |
-| [`test_vosk_piper.py`](test_vosk_piper.py) | Exercises Vosk STT and Piper TTS together. |
-| [`self_test_drive.py`](self_test_drive.py) | End-to-end: imports the live `zeus` module and feeds commands straight into `handle_command()` — full pipeline, no human. |
-| [`test_introspect.py`](test_introspect.py) | Validates the model's self-aware answers against the augmented system prompt (off-robot). |
-| [`test_ollama_text.py`](test_ollama_text.py) | One-shot Ollama text sanity check. |
+- **[`audio_selftest.py`](audio_selftest.py)** — measures the ambient noise floor, then plays a known phrase, records it back, and transcribes it.
+- **[`cmd_capture_test.py`](cmd_capture_test.py)** — checks the VAD command-capture and transcription path without needing a wake word.
+- **[`test_vosk_piper.py`](test_vosk_piper.py)** — exercises Vosk STT and Piper TTS together.
+- **[`self_test_drive.py`](self_test_drive.py)** — the end-to-end one. Imports the live `zeus` module and feeds commands straight into `handle_command()`. Full pipeline, nobody has to say anything.
+- **[`test_introspect.py`](test_introspect.py)** — checks the model's self-aware answers against the augmented system prompt, off-robot.
+- **[`test_ollama_text.py`](test_ollama_text.py)** — one-shot Ollama text check.
 
-## Typical flow
+## A normal testing session
 
 ```bash
 sudo systemctl stop zeus
-touch ~/.zeus_no_move           # optional: disable motion while testing audio/LLM
+touch ~/.zeus_no_move           # talk but don't move, while you work on audio/LLM
 python3 tests/audio_selftest.py
-rm -f ~/.zeus_no_move           # re-enable motion
+rm -f ~/.zeus_no_move           # let it move again
 sudo python3 tests/test_actions_safe.py
 ```

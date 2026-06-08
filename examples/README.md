@@ -1,12 +1,9 @@
 # Examples
 
-Standalone, easy-to-run starting points. Stop the `zeus` service first
-(`sudo systemctl stop zeus`) so these own the hardware.
+Two small scripts to run before you touch `zeus.py`. Stop the service first
+(`sudo systemctl stop zeus`) so they can have the hardware to themselves.
 
-| File | What it does |
-|------|--------------|
-| [`demo.py`](demo.py) | Runs through every PiCrawler gait and preset action with spoken TTS announcements. The fastest way to confirm the robot moves and talks. Run: `sudo python3 demo.py` |
-| [`voice_ollama.py`](voice_ollama.py) | A minimal, self-contained **voice → Ollama → speech** loop, without the full Zeus stack. Great for understanding (or reusing) just the conversational core. |
+- **[`demo.py`](demo.py)** — runs through every PiCrawler gait and preset action and announces each one over TTS. The quickest way to confirm the robot both moves and talks. `sudo python3 demo.py`
+- **[`voice_ollama.py`](voice_ollama.py)** — a stripped-down voice → Ollama → speech loop without the rest of the Zeus stack. Read this one if you just want the conversational core, or want to reuse it somewhere else.
 
-> These are deliberately simpler than [`zeus.py`](../zeus.py) — read them first if the
-> main app feels like a lot.
+These are deliberately simpler than the main app, so they're a gentler place to start.

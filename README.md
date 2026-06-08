@@ -1,90 +1,86 @@
-# Zeus 🕷️ — Autonomous AI Spider Robot
+# Zeus — an AI spider robot that actually listens
 
-Zeus turns a [SunFounder PiCrawler](https://www.sunfounder.com/products/picrawler-kit) (a quadruped "spider" robot on a Raspberry Pi 5) into a **fully offline, voice-driven, face-tracking AI companion**. Say a wake word, ask it something, and it answers out loud and acts it out — walking, waving, doing push-ups, looking around — with the entire brain (speech-to-text → LLM → text-to-speech) running **locally on the Pi**. An optional OpenAI fallback kicks in only when the internet is available and you want it.
+Zeus is what happens when you give a [SunFounder PiCrawler](https://www.sunfounder.com/products/picrawler-kit) — a four-legged "spider" robot running on a Raspberry Pi 5 — a voice, ears, and enough of a brain to hold a short conversation. The whole thing runs on the Pi itself, no cloud needed. You say a wake word, ask it something, and it answers out loud while acting it out: walking around, waving, doing push-ups, tilting its head like it understood you (it usually did).
 
-This repo is the open-source release of that work, meant for **anyone who owns a PiCrawler or is building a similar Pi-based robot from scratch.** Take the whole thing, or lift the parts you need (the brownout-safe movement tests, the on-device LLM benchmarks, the wake-word/STT loop).
+I built this on my own PiCrawler and figured anyone with the same kit — or building a Pi robot from scratch — would rather have the code than start from a blank file. Take all of it, or just lift the parts you need.
 
-> ⚠️ **Heads up:** the hardware libraries (`picrawler`, `robot_hat`, `vilib`, `sunfounder-controller`) are **SunFounder's**, under their own licenses, and are **not** included here — install them from SunFounder (see [Setup](#setup)). This repo contains only original Zeus code.
+Quick heads up before you dig in: the hardware libraries (`picrawler`, `robot_hat`, `vilib`, `sunfounder-controller`) are SunFounder's, not mine, so they aren't in this repo. You grab those from SunFounder (link down in [Setup](#setup)). Everything here is my own code.
 
----
+## What it actually does
 
-## What it does
+- **Listens offline.** Vosk handles the speech-to-text, so it's always half-listening for `computer`, `spider`, `zeus`, or `picrawler`. Nothing gets shipped off to some server to figure out what you said.
+- **Thinks locally.** Ollama running `qwen2.5:1.5b` for text and `moondream:1.8b` for vision. I spent a slightly unreasonable amount of time shaving milliseconds off this — that's what the [`benchmarks/`](benchmarks/) folder is about. There's an optional OpenAI fallback for when it's online and you want a sharper answer.
+- **Talks back** with Piper TTS, streamed sentence by sentence so it starts speaking before it's done thinking. Same trick people use when they start a sentence without knowing how it ends.
+- **Follows your face** with the camera and turns its head to track you. Mildly unsettling, works great.
+- **Moves on purpose.** The model replies with structured actions (`wave_hand`, `push_up`, `fighting`, `nod`, `look_left`…) that fire as they stream in, so the words and the movement actually line up instead of the robot miming something it said five seconds ago.
+- **Tries not to brown itself out.** Twelve servos pulling at once can drop a Pi 5's voltage off a cliff. Zeus checks the voltage before and after every move and aborts if it looks sketchy, and there are two kill-switch files for bench testing without the robot thrashing around. More on that below.
+- **Starts on boot** as a systemd service.
 
-- 🎙️ **Offline wake-word + speech recognition** — Vosk STT, always listening for `computer`, `spider`, `zeus`, or `picrawler`.
-- 🧠 **On-device LLM** — Ollama running `qwen2.5:1.5b` (text) and `moondream:1.8b` (vision), tuned hard for Pi 5 latency. Optional `gpt-4o-mini` fallback when online.
-- 🗣️ **Local text-to-speech** — Piper (`en_US-lessac-medium`), streamed sentence-by-sentence so it starts talking before the full answer is generated.
-- 👁️ **Real-time face tracking** — `vilib` vision + custom yaw/pitch servo control with dead zones and adaptive smoothing.
-- 🦿 **Embodied actions** — the LLM replies with structured actions (`wave_hand`, `push_up`, `fighting`, `nod`, `look_left`…) that execute as they stream in.
-- 🛡️ **Brownout-safe by design** — movement is gated on live `vcgencmd` voltage/throttle checks; kill-switch flag files (`~/.zeus_no_move`, `~/.zeus_no_track`) disable motion for safe bench testing.
-- 🔋 Runs headless as a `systemd` service on boot.
-
-## Architecture
+## How it fits together
 
 ```
         ┌──────────┐   wake word   ┌──────────┐   text    ┌─────────────────┐
- mic ──▶│  Vosk STT │─────────────▶│ command  │──────────▶│  LLM router     │
-        └──────────┘               │ capture  │           │ Ollama (local)  │
-                                   └──────────┘           │ ↳ OpenAI (online)│
-        ┌──────────┐                                       └────────┬────────┘
-camera ▶│  vilib    │── face xy ─▶ yaw/pitch servo tracking          │
+ mic ──▶│  Vosk STT │─────────────▶│ command  │──────────▶│  LLM router      │
+        └──────────┘               │ capture  │           │ Ollama (local)   │
+                                   └──────────┘           │ └ OpenAI (online)│
+        ┌──────────┐                                       └────────┬─────────┘
+camera ▶│  vilib    │── face xy ─▶ yaw/pitch head tracking          │
         └──────────┘                                        actions + answer
                                                                     │
                           ┌─────────────────────────────────────────┤
                           ▼                                          ▼
                  ┌─────────────────┐                        ┌────────────────┐
-                 │ PiCrawler gait/  │                        │  Piper TTS     │
+                 │ PiCrawler gait / │                        │  Piper TTS     │
                  │ preset_actions   │                        │  (speaker)     │
                  └─────────────────┘                        └────────────────┘
 ```
 
-## Repo layout
+## What's in here
 
-| Path | What's inside |
-|------|---------------|
-| [`zeus.py`](zeus.py) | The main application — STT, wake word, LLM routing, TTS, face tracking, action execution. Runs as the `zeus` service. |
-| [`examples/`](examples/) | Standalone demos: a movement showcase and a minimal voice→Ollama loop. Good first things to run. |
-| [`benchmarks/`](benchmarks/) | On-Pi LLM latency/contract benchmarks — how the model choices above were picked. |
-| [`tests/`](tests/) | Hardware & pipeline self-tests, including brownout-gated motion checks and no-human audio loopback tests. |
+- **[`zeus.py`](zeus.py)** — the whole thing. STT, wake word, LLM routing, TTS, face tracking, action execution. This is what runs as the service. It's big; start with the examples if it looks like a wall.
+- **[`examples/`](examples/)** — two small, standalone scripts to run first: a movement-and-talking demo, and a bare-bones voice→Ollama loop.
+- **[`benchmarks/`](benchmarks/)** — how I picked the models and prompts. The Pi is the bottleneck, so I measured instead of guessing.
+- **[`tests/`](tests/)** — hardware and pipeline checks, including the brownout-gated motion tests and audio tests that don't need you to say anything.
 
-Each folder has its own README.
+Every folder has its own README.
 
-## Hardware
+## What you need
 
-- **SunFounder PiCrawler** kit (Robot HAT + 12× servos, quadruped chassis)
-- **Raspberry Pi 5** (this is tuned for the Pi 5; a Pi 4 works but is slower)
-- Pi Camera, a USB/I²S mic, and a speaker
-- A solid battery/power supply — under-powering the Pi while 12 servos move **will** brown it out (hence all the throttle-gating in `tests/`)
+- A SunFounder **PiCrawler** kit (the Robot HAT, twelve servos, the chassis)
+- A **Raspberry Pi 5** — this is tuned for the 5; a Pi 4 runs it, just slower
+- The Pi camera, a mic, and a speaker
+- A power supply that can actually keep up. Under-powering the Pi while the servos move is the single most annoying way to waste an afternoon, which is exactly why there's so much voltage-checking in `tests/`.
 
 ## Setup
 
 ```bash
-# 1. SunFounder libraries (NOT in this repo — install per SunFounder's docs)
+# 1. SunFounder's libraries (not in this repo — install per their docs)
 #    https://docs.sunfounder.com/projects/picrawler/en/latest/
-#    Provides: picrawler, robot_hat, vilib, sunfounder-controller
+#    gives you: picrawler, robot_hat, vilib, sunfounder-controller
 
-# 2. Python deps for Zeus
+# 2. Zeus's Python deps
 pip install -r requirements.txt
 
-# 3. Local AI runtimes
-#    Ollama:  https://ollama.com
+# 3. The local AI bits
+#    Ollama: https://ollama.com
 ollama pull qwen2.5:1.5b
 ollama pull moondream:1.8b
-#    Piper TTS voice: en_US-lessac-medium  (https://github.com/rhasspy/piper)
-#    Vosk model: vosk-model-small-en-us-0.15  (https://alphacephei.com/vosk/models)
-#      → unpack into /home/pi/ so zeus.py can find it
+#    Piper TTS voice en_US-lessac-medium: https://github.com/rhasspy/piper
+#    Vosk model vosk-model-small-en-us-0.15: https://alphacephei.com/vosk/models
+#      unpack it into /home/pi/ so zeus.py finds it
 
-# 4. (optional) online fallback
-export OPENAI_API_KEY=sk-...        # never hard-code it; see .env.example
+# 4. (optional) the online fallback — set it in your env, don't paste it in code
+export OPENAI_API_KEY=sk-...
 
-# 5. Run
-sudo python3 zeus.py                 # sudo needed for servo/GPIO access
+# 5. Go
+sudo python3 zeus.py     # sudo because the servos and GPIO need it
 ```
 
-See [`.env.example`](.env.example) for configurable environment variables.
+There's a [`.env.example`](.env.example) with the handful of things you can configure.
 
-### Run on boot (systemd)
+## Running it on boot
 
-Zeus is designed to run as a service. A minimal unit:
+Zeus is meant to live as a systemd service. Minimal version:
 
 ```ini
 # /etc/systemd/system/zeus.service
@@ -106,18 +102,20 @@ WantedBy=multi-user.target
 sudo systemctl enable --now zeus
 ```
 
-> **Bench-testing tip:** stop the service (`sudo systemctl stop zeus`) before running anything in `tests/`, so only one process owns the hardware. Drop a `~/.zeus_no_move` file to disable all motion while you work on the audio/LLM side.
+When you want to poke at things in `tests/`, stop the service first (`sudo systemctl stop zeus`) so two processes aren't fighting over the same servos. Drop an empty `~/.zeus_no_move` file and Zeus keeps talking but stops moving — handy when you're working on the audio side and don't want it doing push-ups next to your keyboard.
 
-## Safety notes
+## Not breaking things
 
-- The PiCrawler is strong and fast. Run motion tests with the robot on a stand or clear space.
-- Zeus checks Pi voltage before/after moves and aborts on brownout — keep that behavior if you fork it.
-- Servo work needs root; be deliberate about what runs as root.
+The PiCrawler is stronger and faster than it looks. A few things I learned the boring way:
+
+- Run motion tests with the robot on a stand or some clear space. It will move further than you expect.
+- Keep the brownout checks if you fork this. A Pi that resets mid-move is a Pi that corrupts something eventually.
+- Servo control needs root, so be deliberate about what you're running as root.
 
 ## License
 
-[MIT](LICENSE) © 2026 Gideon Glago. SunFounder libraries are excluded and remain under their own licenses.
+[MIT](LICENSE) — do what you want, just keep the notice. SunFounder's libraries aren't included and stay under their own licenses.
 
-## Acknowledgements
+## Thanks
 
-Built on [SunFounder PiCrawler](https://www.sunfounder.com/products/picrawler-kit), [Vosk](https://alphacephei.com/vosk/), [Ollama](https://ollama.com), [Piper](https://github.com/rhasspy/piper), and the open models `qwen2.5`, `moondream`, and `llama3.2`.
+Standing on the shoulders of [SunFounder](https://www.sunfounder.com/), [Vosk](https://alphacephei.com/vosk/), [Ollama](https://ollama.com), [Piper](https://github.com/rhasspy/piper), and the open `qwen2.5`, `moondream`, and `llama3.2` models. I mostly just wired them together and taught the result to do push-ups.
