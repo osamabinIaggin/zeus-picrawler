@@ -1,0 +1,12 @@
+# Zeus Python dependencies (pip install -r requirements.txt)
+requests>=2.28
+vosk>=0.3.45
+
+# ── NOT installable via this file — install separately ─────────────────────────
+# Hardware libraries (from SunFounder; see README):
+#   picrawler, robot_hat, vilib, sunfounder-controller
+#
+# External runtimes:
+#   Ollama      https://ollama.com         models: qwen2.5:1.5b, moondream:1.8b
+#   Piper TTS   https://github.com/rhasspy/piper   voice: en_US-lessac-medium
+#   Vosk model  https://alphacephei.com/vosk/models  vosk-model-small-en-us-0.15

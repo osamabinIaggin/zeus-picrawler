@@ -1,0 +1,34 @@
+# Secrets / env
+.env
+*.env
+!.env.example
+
+# Models & large blobs (download separately — see README)
+*.zip
+*.onnx
+*.onnx.json
+vosk-model-*/
+*.gguf
+
+# Logs & media artifacts
+*.log
+*.jpg
+*.jpeg
+*.png
+*.wav
+
+# Runtime flag files
+.zeus_no_move
+.zeus_no_track
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
