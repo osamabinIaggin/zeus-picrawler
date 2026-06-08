@@ -2,7 +2,7 @@
 
 Zeus is what happens when you give a [SunFounder PiCrawler](https://www.sunfounder.com/products/picrawler-kit) — a four-legged "spider" robot running on a Raspberry Pi 5 — a voice, ears, and enough of a brain to hold a short conversation. The whole thing runs on the Pi itself, no cloud needed. You say a wake word, ask it something, and it answers out loud while acting it out: walking around, waving, doing push-ups, tilting its head like it understood you (it usually did).
 
-I built this on my own PiCrawler and figured anyone with the same kit — or building a Pi robot from scratch — would rather have the code than start from a blank file. Take all of it, or just lift the parts you need.
+I built this on my own PiCrawler and figured anyone with the same kit — or building a Pi robot from scratch — would rather have the code than start from a blank file. Take all of it, or just lift the parts you need. I would love some ideas to improve or extend it's current functionality.
 
 Quick heads up before you dig in: the hardware libraries (`picrawler`, `robot_hat`, `vilib`, `sunfounder-controller`) are SunFounder's, not mine, so they aren't in this repo. You grab those from SunFounder (link down in [Setup](#setup)). Everything here is my own code.
 
