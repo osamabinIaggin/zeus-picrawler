@@ -1,6 +1,8 @@
 # Zeus Python dependencies (pip install -r requirements.txt)
 requests>=2.28
 vosk>=0.3.45
+flask>=2.0            # zeus_web.py — mobile web control panel
+onnxruntime>=1.16     # Phase 5 vision — YOLOv8n object detection
 
 # ── NOT installable via this file — install separately ─────────────────────────
 # Hardware libraries (from SunFounder; see README):

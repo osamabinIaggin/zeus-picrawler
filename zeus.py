@@ -15,6 +15,7 @@ Latency improvements (vs original):
 
 import array
 import audioop
+import base64
 import glob
 import json
 import math
@@ -27,6 +28,7 @@ import time
 import threading
 import wave
 
+import cv2
 import requests
 import vosk
 from picrawler import Picrawler
@@ -373,9 +375,30 @@ TEXT_MODEL   = "qwen2.5:1.5b"
 VISION_MODEL = "moondream:1.8b"
 MODELS_WARMED = False
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # optional online fallback; set via env, never hard-code
+def _load_env_file(path):
+    """Minimal .env reader (no python-dotenv dependency). KEY=VALUE per line."""
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except FileNotFoundError:
+        pass
+
+
+# Secrets live in ~/.env (or alongside this script), never hardcoded in source.
+for _envp in (os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+              os.path.expanduser("~/.env")):
+    _load_env_file(_envp)
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_URL     = "https://api.openai.com/v1/chat/completions"
 OPENAI_MODEL   = "gpt-4o-mini"
+if not OPENAI_API_KEY:
+    print("[config] no OPENAI_API_KEY in env — cloud LLM/vision disabled, using local only")
 
 # ── Internet status cache ─────────────────────────────────────────────────────
 # FIX: was checking internet on every call (~236 ms overhead).
@@ -562,10 +585,16 @@ def warm_models():
     except Exception as e:
         print("Warmup error:", TEXT_MODEL, e)
     try:
-        print("Warming:", VISION_MODEL)
+        print("Warming:", VISION_MODEL, "(with image — loads the vision tower)")
+        # Warm the VISION path, not just text: a text-only prompt leaves the image
+        # projector cold, making the first real query ~108s instead of ~14s. Send a
+        # tiny dummy image so the encoder is resident before the user asks.
+        import numpy as np  # noqa: local import; only needed here
+        ok, buf = cv2.imencode(".jpg", np.zeros((32, 32, 3), dtype=np.uint8))
+        dummy_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
         requests.post(OLLAMA_URL, json={
-            "model": VISION_MODEL, "prompt": "ok", "stream": False,
-            "options": {"num_predict": 1},
+            "model": VISION_MODEL, "prompt": "ok", "images": [dummy_b64],
+            "stream": False, "options": {"num_predict": 1},
             "keep_alive": -1,
         }, timeout=180)
     except Exception as e:
@@ -610,7 +639,7 @@ def _parse_llm_raw(raw):
 
 
 def call_llm(user_text):
-    if has_internet():
+    if OPENAI_API_KEY and has_internet():
         result = _call_openai(user_text)
         if result is not None:
             return result
@@ -782,6 +811,142 @@ def _answer_self_query(text):
     """
     system = OLLAMA_SYSTEM_PROMPT + "\n\n" + build_self_context()
     _stream_ollama_and_respond(text, system=system, num_predict=120)
+
+
+# ── Phase 5: vision — let Zeus actually SEE via the moondream model ────────────
+# moondream:1.8b is already resident in Ollama (warmed at boot). We grab the
+# current camera frame (Vilib.flask_img), JPEG-encode it, and ask moondream the
+# user's question. Plain prose back (moondream isn't a JSON/persona model), spoken
+# as-is with a light lead-in. Works in no-move mode — Zeus sees whatever's in front.
+_VISION_QUERY_RE = re.compile(
+    r"\b(what (do|can) you see|what'?s (in front|out there|that|this)|"
+    r"look at (this|that|it|me|my)|can you see|do you see|what am i holding|"
+    r"what'?s in your (view|sight)|describe (what|this|that|the (scene|view|room))|"
+    r"take a (photo|picture|look)|use your (eyes|camera|vision)|"
+    r"what does it look like|what is (this|that)|read (this|the)|"
+    r"who (is|am i)|how many (people|fingers)|what colou?r)\b",
+    re.IGNORECASE,
+)
+
+_VISION_LEADINS = ["Let me look... ", "Looking... ", "Hmm, I see... ", "Okay... "]
+_VISION_PROMPT_DEFAULT = "Describe what you see in one or two short sentences."
+_VISION_MAX_W          = 384   # downscale width — smaller upload + lighter moondream
+_VISION_TIMEOUT_CLOUD  = 15
+_VISION_TIMEOUT_LOCAL  = 90    # CPU inference on the 1.8b model is slow (~14s warm)
+# Spoken while moondream (offline) grinds, so the user isn't left in silence.
+_VISION_LOCAL_WAIT = ["Let me take a good look, one sec.",
+                      "Hold on, focusing my eyes.",
+                      "Give me a moment to really look."]
+
+
+def is_vision_query(text):
+    return bool(_VISION_QUERY_RE.search(text or ""))
+
+
+def _capture_jpeg_b64():
+    """Grab the current camera frame, downscaled, as base64 JPEG (or None)."""
+    try:
+        frame = Vilib.flask_img            # current frame (numpy/cv2 image)
+        h, w = frame.shape[:2]
+        if w > _VISION_MAX_W:
+            frame = cv2.resize(frame, (_VISION_MAX_W, int(h * _VISION_MAX_W / w)))
+        ok, buf = cv2.imencode(".jpg", frame)
+        if not ok:
+            return None
+        return base64.b64encode(buf.tobytes()).decode("ascii")
+    except Exception as e:
+        print("[vision] frame capture failed:", e)
+        return None
+
+
+def _openai_vision(question, img_b64):
+    """Ask gpt-4o-mini about the image. Returns description str, or None on failure."""
+    try:
+        resp = requests.post(OPENAI_URL, json={
+            "model": OPENAI_MODEL,
+            "messages": [
+                {"role": "system", "content":
+                 "You are Zeus, a witty spider robot describing what your camera sees. "
+                 "Answer in one or two short, natural spoken sentences."},
+                {"role": "user", "content": [
+                    {"type": "text", "text": question},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                ]},
+            ],
+            "max_tokens": 120,
+        }, headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json"}, timeout=_VISION_TIMEOUT_CLOUD)
+        if resp.status_code == 429:
+            print("[vision] OpenAI 429 — falling back to moondream")
+            return None
+        resp.raise_for_status()
+        desc = resp.json()["choices"][0]["message"]["content"].strip()
+        print("[vision] gpt-4o-mini:", repr(desc))
+        return desc or None
+    except Exception as e:
+        print("[vision] OpenAI vision error:", e, "— falling back to moondream")
+        return None
+
+
+def _moondream_vision(question, img_b64):
+    """Ask local moondream about the image. Returns description str, or '' on failure."""
+    try:
+        resp = requests.post(OLLAMA_URL, json={
+            "model":  VISION_MODEL,
+            "prompt": question,
+            "images": [img_b64],
+            "stream": False,
+            "options": {"num_predict": 80, "num_ctx": 2048, "num_thread": 4,
+                        "temperature": 0.2},
+            "keep_alive": -1,
+        }, timeout=_VISION_TIMEOUT_LOCAL)
+        resp.raise_for_status()
+        desc = (resp.json().get("response") or "").strip()
+        print("[vision] moondream:", repr(desc))
+        return desc
+    except requests.exceptions.Timeout:
+        print("[vision] moondream timed out")
+        return ""
+    except Exception as e:
+        print("[vision] moondream error:", e)
+        return ""
+
+
+def describe_scene(text):
+    """Hybrid vision: gpt-4o-mini when online (~2-3s), moondream offline (~14s warm)."""
+    if not _camera_ready.is_set():
+        speak("My eyes aren't ready yet, give me a second.")
+        return
+    img_b64 = _capture_jpeg_b64()
+    if img_b64 is None:
+        speak("I can't quite see anything right now.")
+        return
+    question = (text or "").strip() or _VISION_PROMPT_DEFAULT
+
+    # Cloud first (fast). gpt-4o-mini already returns persona-flavored prose.
+    if OPENAI_API_KEY and has_internet():
+        print(f"[vision] cloud ask: {question!r}")
+        desc = _openai_vision(question, img_b64)
+        if desc:
+            speak(desc)
+            return
+        invalidate_internet_cache()   # cloud failed — recheck next time
+
+    # Offline fallback: moondream is slow, so say something first to mask the wait.
+    print(f"[vision] local ask: {question!r}")
+    speak(random.choice(_VISION_LOCAL_WAIT))
+    action_in_progress.set()
+    is_speaking.set()
+    try:
+        desc = _moondream_vision(question, img_b64)
+    finally:
+        action_in_progress.clear()
+        is_speaking.clear()
+    if not desc:
+        speak("My vision's being slow right now, try again in a moment.")
+        return
+    speak(random.choice(_VISION_LEADINS) + desc)
 
 
 # ── Actions ───────────────────────────────────────────────────────────────────
@@ -1010,10 +1175,30 @@ _last_greet_time    = 0.0
 _GREET_ON_FRAMES    = 3        # consecutive face frames before greeting (debounce)
 _GREET_OFF_FRAMES   = 6        # consecutive no-face frames before re-arming
 
+# ── Phase 4-D: departure farewell + welcome-back on quick return ───────────────
+_departed_time       = 0.0     # epoch the face was last seen leaving
+_last_farewell_time  = 0.0
+_WELCOME_BACK_WINDOW = 180.0   # return within this → "welcome back" instead of a fresh hello
+_FAREWELL_COOLDOWN   = 90.0    # don't bid farewell more often than this
 
-def _do_proactive_greeting():
+_FAREWELL_LINES = [
+    "Leaving already? Rude.",
+    "Off you go then. I'll hold down the fort.",
+    "Bye I guess. I'll just be here. Forever.",
+    "And... they're gone. Cool. Cool cool cool.",
+]
+_WELCOME_BACK_LINES = [
+    "Oh, you're back. Missed me already?",
+    "Welcome back. I didn't move an inch, promise.",
+    "There you are. Couldn't stay away, huh.",
+    "Back so soon? I'm flattered.",
+]
+
+
+def _do_proactive_greeting(returning=False):
     global _last_command_time, _last_face_time
-    print(f"[proactive] face seen — greeting ({time_of_day()}/{current_mood()})")
+    kind = "welcome-back" if returning else "greeting"
+    print(f"[proactive] face seen — {kind} ({time_of_day()}/{current_mood()})")
     note_interaction()
     _last_face_time = time.time()
     action_in_progress.set()
@@ -1021,7 +1206,7 @@ def _do_proactive_greeting():
     try:
         if MOVEMENT_ENABLED:
             wave_hand(crawler)
-        speak(build_greeting())
+        speak(random.choice(_WELCOME_BACK_LINES) if returning else build_greeting())
     finally:
         action_in_progress.clear()
         is_speaking.clear()
@@ -1031,7 +1216,7 @@ def _do_proactive_greeting():
 def proactive_greeting_thread():
     """Greet when a face appears and Zeus is idle — independent of face tracking,
     so it works even in no-move mode. Wave is gated on MOVEMENT_ENABLED."""
-    global _last_greet_time
+    global _last_greet_time, _departed_time, _last_farewell_time
     on_count = off_count = 0
     armed = True   # only greet on a fresh arrival (face must leave + return to re-arm)
     _camera_ready.wait(timeout=60)
@@ -1048,14 +1233,256 @@ def proactive_greeting_thread():
             on_count += 1
             if armed and on_count >= _GREET_ON_FRAMES:
                 if time.time() - _last_greet_time >= _PROACTIVE_COOLDOWN:
+                    # Phase 4-D: a quick return gets "welcome back" instead of hello.
+                    returning = (0 < _departed_time
+                                 and time.time() - _departed_time <= _WELCOME_BACK_WINDOW)
                     _last_greet_time = time.time()
                     armed = False
-                    _do_proactive_greeting()
+                    _do_proactive_greeting(returning=returning)
         else:
             on_count = 0
             off_count += 1
-            if off_count >= _GREET_OFF_FRAMES:
-                armed = True   # face left long enough — re-arm for next arrival
+            if off_count == _GREET_OFF_FRAMES:
+                armed = True            # face left long enough — re-arm for next arrival
+                _departed_time = time.time()
+                # Phase 4-D: bid farewell once per departure, only if we'd greeted
+                # them (so we don't say bye to a face that never engaged) and the
+                # room is calm. Quiet-gated, cooldowned.
+                if (_last_greet_time > 0
+                        and time.time() - _last_farewell_time >= _FAREWELL_COOLDOWN
+                        and _proactive_ok(require_quiet=True)):
+                    _last_farewell_time = time.time()
+                    print("[proactive] face left — farewell")
+                    action_in_progress.set()
+                    is_speaking.set()
+                    try:
+                        speak(random.choice(_FAREWELL_LINES))
+                    finally:
+                        action_in_progress.clear()
+                        is_speaking.clear()
+
+
+# ── Phase 4-C: adaptive ambient-quiet gate ─────────────────────────────────────
+# Room noise is dynamic, so a hardcoded "quiet" level would never match. Instead
+# we track the noise FLOOR with an asymmetric EMA (falls fast, rises slowly, so
+# it hugs the quiet baseline and isn't dragged up by speech), and call it quiet
+# when the recent level sits close to that floor — i.e. nobody is talking and no
+# burst is happening RIGHT NOW. The main voice loop feeds RMS via note_ambient()
+# from the Vosk audio it already reads (the mic has only one capture subdevice,
+# so we can't open a second recorder).
+_amb_floor   = 0.0     # slow EMA of the noise floor
+_amb_fast    = 0.0     # fast EMA of recent level
+_amb_samples = 0       # chunks seen since start (warmup counter)
+_AMB_WARMUP  = 50      # ~2 s of chunks before the gate trusts its baseline
+_AMB_FAST_A  = 0.30    # fast EMA weight (reacts within a few chunks)
+_AMB_UP_A    = 0.01    # floor rises very slowly
+_AMB_DOWN_A  = 0.30    # floor follows drops quickly
+_AMB_QUIET_K = 1.8     # "quiet" = fast level within this multiple of the floor
+_AMB_QUIET_MARGIN = 60.0   # absolute slack so a near-silent floor isn't hair-trigger
+
+
+def note_ambient(rms):
+    """Feed one RMS sample (called only when the mic is live, not during TTS)."""
+    global _amb_floor, _amb_fast, _amb_samples
+    _amb_samples += 1
+    if _amb_samples == 1:
+        _amb_floor = _amb_fast = rms
+        return
+    _amb_fast += _AMB_FAST_A * (rms - _amb_fast)
+    a = _AMB_DOWN_A if rms < _amb_floor else _AMB_UP_A
+    _amb_floor += a * (rms - _amb_floor)
+
+
+def ambient_is_quiet():
+    """True if the room is currently calm relative to its own noise floor."""
+    if _amb_samples < _AMB_WARMUP:
+        return True   # not enough data yet — don't block on an unknown
+    return _amb_fast <= _amb_floor * _AMB_QUIET_K + _AMB_QUIET_MARGIN
+
+
+# ── Phase 4: shared availability gate for ALL proactive speech ─────────────────
+# The research lesson: only interject when the user is "available" — not mid-
+# interaction, not asleep, and (for non-urgent speech) not into a noisy moment.
+# Critical alerts (e.g. under-voltage) pass allow_sleep=True to speak even when
+# curled up; chatty behaviors pass require_quiet=True to defer to the room.
+def _proactive_ok(allow_sleep=False, require_quiet=False):
+    if is_speaking.is_set() or is_listening.is_set() or action_in_progress.is_set():
+        return False
+    if not allow_sleep and zeus_sleeping.is_set():
+        return False
+    if require_quiet and not ambient_is_quiet():
+        return False
+    return True
+
+
+# ── Phase 4-A: proactive self-health alerts ────────────────────────────────────
+# Zeus watches its own power rail (vcgencmd throttle) and SoC temperature and
+# speaks up when something turns bad — edge-triggered (only on transition into a
+# bad state) with a cooldown, so it warns once rather than nagging continuously.
+# Directly motivated by the real brownout history on the servo battery.
+_HEALTH_POLL_SEC   = 15.0     # how often to sample power/temp
+_HEALTH_COOLDOWN   = 90.0     # min seconds between repeats of the SAME alert
+_TEMP_WARN_C       = 75.0     # SoC getting hot
+_TEMP_CRIT_C       = 80.0     # SoC about to thermally throttle
+_TEMP_CLEAR_C      = 70.0     # hysteresis: must cool below this to re-arm temp alert
+
+_UNDERVOLT_LINES = [
+    "Heads up — my power's dropping. Better plug me in before I keel over.",
+    "Uh, I'm browning out here. Can I get some real power?",
+    "Low voltage warning. I'd like to not faint mid-sentence, please.",
+]
+_HOT_LINES = [
+    "I'm running hot. Mind giving me a moment to cool off?",
+    "Getting toasty in here. My brain's overheating a little.",
+    "Warning: I'm warm enough to fry an egg on. Easing off.",
+]
+
+
+def _read_throttled():
+    """Return the raw vcgencmd throttle bitmask (int), or None on failure."""
+    try:
+        out = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True,
+                             text=True, timeout=3).stdout.strip()
+        return int(out.split("=")[1], 16) if "=" in out else 0
+    except Exception:
+        return None
+
+
+def _soc_temp_c():
+    """Return SoC temperature in °C (float), or None on failure."""
+    try:
+        out = subprocess.run(["vcgencmd", "measure_temp"], capture_output=True,
+                             text=True, timeout=3).stdout.strip()
+        # format: temp=54.0'C
+        return float(out.split("=")[1].split("'")[0]) if "=" in out else None
+    except Exception:
+        return None
+
+
+def health_monitor_thread():
+    """Speak up on newly-bad power or temperature. Works in no-move mode."""
+    last_undervolt_alert = 0.0
+    last_temp_alert      = 0.0
+    undervolt_active     = False   # latch: already in an under-voltage episode
+    temp_active          = False   # latch: already in a hot episode
+    print("[health] self-health monitor started")
+    while True:
+        time.sleep(_HEALTH_POLL_SEC)
+        now = time.time()
+
+        val = _read_throttled()
+        if val is not None:
+            uv_now = bool(val & 0x1)            # under-voltage RIGHT NOW
+            if uv_now:
+                # Edge: new episode, OR same episode but cooldown elapsed.
+                if (not undervolt_active
+                        or now - last_undervolt_alert >= _HEALTH_COOLDOWN):
+                    if _proactive_ok(allow_sleep=True):   # power is critical
+                        last_undervolt_alert = now
+                        print("[health] under-voltage — alerting")
+                        if zeus_sleeping.is_set():
+                            wake_from_sleep()
+                        action_in_progress.set()
+                        try:
+                            speak(random.choice(_UNDERVOLT_LINES))
+                        finally:
+                            action_in_progress.clear()
+                undervolt_active = True
+            else:
+                undervolt_active = False
+
+        temp = _soc_temp_c()
+        if temp is not None:
+            if temp >= _TEMP_WARN_C:
+                if (not temp_active
+                        or now - last_temp_alert >= _HEALTH_COOLDOWN):
+                    crit = temp >= _TEMP_CRIT_C
+                    if _proactive_ok(allow_sleep=crit):
+                        last_temp_alert = now
+                        print(f"[health] high temp {temp:.1f}C — alerting")
+                        action_in_progress.set()
+                        try:
+                            speak(random.choice(_HOT_LINES))
+                        finally:
+                            action_in_progress.clear()
+                temp_active = True
+            elif temp <= _TEMP_CLEAR_C:
+                temp_active = False   # cooled down — re-arm
+
+
+# ── Phase 4-B: idle banter — spontaneous remarks when present but quiet ─────────
+# When a face is visible but nobody's said anything for a while AND the room is
+# calm (Phase 4-C gate), Zeus occasionally pipes up unprompted. Long randomized
+# cooldown + mood/time variety = the research's consistency-vs-variability balance
+# (familiar voice, never the same line back-to-back). Curated lines, so no LLM
+# latency or RAM contention. Does NOT count as a user interaction (so it won't
+# fake away the 'lonely' mood it might be reacting to).
+_BANTER_MIN_IDLE  = 75.0     # present + silent at least this long before a remark
+_BANTER_COOLDOWN  = 180.0    # base min seconds between remarks
+_BANTER_JITTER    = 120.0    # extra random seconds on top (so it's not metronomic)
+
+BANTER = {
+    "morning":   ["Quiet morning, huh. I'll just be here. Existing.",
+                  "You know I can see you, right? Say hi sometime.",
+                  "Lovely morning to stand perfectly still and judge.",],
+    "afternoon": ["I'm not bored. I'm... conserving enthusiasm.",
+                  "We could be doing something. Just saying.",
+                  "Still here. Still cooler than the average houseplant.",],
+    "evening":   ["Long day? You and me both, and I don't even have legs that work.",
+                  "Evening's nice. We should chat more. Or, you know, at all.",
+                  "I've been watching the wall. It's not doing much.",],
+    "night":     ["It's late and we're both still up. Suspicious.",
+                  "Shh. Just kidding, say something, it's quiet in here.",
+                  "Night shift, just the two of us.",],
+}
+_MOOD_BANTER = {
+    "lonely":  ["Don't mind me, just craving a little attention over here.",
+                "Hello? Anyone? I'll take a single word.",],
+    "playful": ["Okay this is fun, what else have you got?",
+                "I'm warmed up now. Throw me something.",],
+    "grumpy":  ["Lot of waking me up earlier. I'm still recovering, emotionally.",],
+    "sleepy":  ["*yawn* ...I might doze off if nothing happens soon.",],
+}
+
+
+def _build_banter():
+    mood = current_mood()
+    pool = list(BANTER.get(time_of_day(), []))
+    pool += _MOOD_BANTER.get(mood, [])
+    return random.choice(pool) if pool else None
+
+
+def idle_banter_thread():
+    """Occasionally remark when a face is present but the room is idle and calm."""
+    next_ok = time.time() + _BANTER_COOLDOWN   # don't banter immediately on boot
+    _camera_ready.wait(timeout=60)
+    print("[banter] idle-banter watcher started")
+    while True:
+        time.sleep(5.0)
+        now = time.time()
+        if now < next_ok:
+            continue
+        if zeus_sleeping.is_set():
+            continue
+        # Only talk to someone who's actually here.
+        if Vilib.detect_obj_parameter.get("human_n", 0) <= 0:
+            continue
+        # Present but silent for a while?
+        if now - _last_command_time < _BANTER_MIN_IDLE:
+            continue
+        # Calm moment + not mid-interaction (Phase 4-C gate).
+        if not _proactive_ok(require_quiet=True):
+            continue
+        line = _build_banter()
+        if not line:
+            continue
+        print(f"[banter] {time_of_day()}/{current_mood()}: {line}")
+        action_in_progress.set()
+        try:
+            speak(line)
+        finally:
+            action_in_progress.clear()
+        next_ok = time.time() + _BANTER_COOLDOWN + random.uniform(0, _BANTER_JITTER)
 
 
 def pregenerate_acks():
@@ -1442,6 +1869,17 @@ def handle_command(text):
         print("Shortcut:", text, "→", actions)
         handle_response(actions, answer)
         return
+    # "What do you see?" → vision path (capture frame, ask moondream). Checked
+    # before self-query/LLM so sight questions don't get misrouted to text.
+    if is_vision_query(text):
+        print("Vision-query:", text)
+        if ACK_WAVS:
+            subprocess.Popen(
+                ["aplay", "-D", "robothat", random.choice(ACK_WAVS)],
+                stderr=subprocess.DEVNULL,
+            )
+        describe_scene(text)
+        return
     # Questions about itself / casual chat → conversational path with live self-context.
     if is_self_query(text):
         print("Self-query:", text)
@@ -1459,7 +1897,7 @@ def handle_command(text):
             stderr=subprocess.DEVNULL,
         )
     result_json = None
-    if has_internet():
+    if OPENAI_API_KEY and has_internet():
         result_json = _call_openai(text)
         if result_json is None:
             invalidate_internet_cache()
@@ -1575,6 +2013,21 @@ def main():
     # Proactive face-greeting runs regardless of movement (wave is gated internally).
     threading.Thread(target=proactive_greeting_thread, daemon=True).start()
 
+    # Self-health alerts (power/temp) — works in no-move mode.
+    threading.Thread(target=health_monitor_thread, daemon=True).start()
+
+    # Idle banter — spontaneous remarks when present but quiet (no-move friendly).
+    threading.Thread(target=idle_banter_thread, daemon=True).start()
+
+    # Web control panel (phone UI over Tailscale) — optional, never blocks boot.
+    try:
+        import zeus_web
+        zeus_web.start(handle_command, run_actions, sorted(ACTION_MAP.keys()),
+                       get_frame=lambda: Vilib.flask_img)
+        print("Web UI: http://0.0.0.0:8080")
+    except Exception as e:
+        print("Web UI failed to start:", e)
+
     sample_rate = 44100
     rec = vosk.KaldiRecognizer(vosk_model, sample_rate)
     awake = False
@@ -1625,6 +2078,12 @@ def main():
             # Suppress while speaking or for cooldown period after speech
             if is_speaking.is_set() or time.time() < _suppress_until:
                 continue
+
+            # Mic is live here — feed the ambient-quiet gate (Phase 4-C).
+            try:
+                note_ambient(audioop.rms(data, 2))
+            except Exception:
+                pass
 
             if not rec.AcceptWaveform(data):
                 continue
