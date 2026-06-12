@@ -12,3 +12,7 @@ onnxruntime>=1.16     # Phase 5 vision — YOLOv8n object detection
 #   Ollama      https://ollama.com         models: qwen2.5:1.5b, moondream:1.8b
 #   Piper TTS   https://github.com/rhasspy/piper   voice: en_US-lessac-medium
 #   Vosk model  https://alphacephei.com/vosk/models  vosk-model-small-en-us-0.15
+flask-sock
+simple-websocket
+aiortc
+av

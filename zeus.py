@@ -175,6 +175,8 @@ _last_command_time = 0.0   # epoch; updated by voice loop
 
 # Signals the voice loop to flush and restart arecord (clears stale buffer after sleep)
 _reset_mic = threading.Event()
+# While set, the voice loop releases the mic so the web intercom can record.
+call_mode = threading.Event()
 
 
 def lerp(a, b, t):
@@ -371,7 +373,7 @@ def match_shortcut(text):
 
 # ── LLM — OpenAI (online) + Ollama (offline fallback) ────────────────────────
 OLLAMA_URL   = "http://localhost:11434/api/generate"
-TEXT_MODEL   = "qwen2.5:1.5b"
+TEXT_MODEL   = "qwen2.5:0.5b"   # 3x faster than 1.5b, still holds the JSON contract
 VISION_MODEL = "moondream:1.8b"
 MODELS_WARMED = False
 
@@ -980,6 +982,7 @@ ACTION_MAP = {
     "bob":         lambda: bob(),
     # Fun
     "play_music":  lambda: play_music(),
+    "dance":       lambda: dance_party(),
 }
 
 
@@ -1012,7 +1015,10 @@ def handle_response(actions, answer):
 
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
-PIPER_MODEL = "/home/pi/en_US-lessac-medium.onnx"
+# Amy (warmer, more natural) preferred; fall back to lessac if not downloaded.
+PIPER_MODEL = "/home/pi/en_US-amy-medium.onnx"
+if not os.path.exists(PIPER_MODEL):
+    PIPER_MODEL = "/home/pi/en_US-lessac-medium.onnx"
 
 ACK_PHRASES = [
     "Sure, one moment.",
@@ -1501,6 +1507,13 @@ def pregenerate_acks():
 def speak(text):
     global _suppress_until
     is_speaking.set()
+    # Publish the text to the web chat immediately (audio attaches when done).
+    sid = None
+    try:
+        import zeus_web
+        sid = zeus_web.note_speech_text(text)
+    except Exception:
+        pass
     try:
         piper = subprocess.Popen(
             ["piper", "--model", PIPER_MODEL, "--output-raw"],
@@ -1508,14 +1521,37 @@ def speak(text):
         )
         aplay = subprocess.Popen(
             ["aplay", "-D", "robothat", "-f", "S16_LE", "-r", "22050", "-c", "1", "-q"],
-            stdin=piper.stdout, stderr=subprocess.DEVNULL,
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
-        piper.stdout.close()
         piper.stdin.write(text.encode("utf-8"))
         piper.stdin.close()
+        # Pump piper's raw audio to the speaker while keeping a copy so the
+        # web UI can replay Zeus's voice on the phone (Phase 3).
+        raw_chunks = []
+        _feed = None
+        try:
+            import zeus_web
+            _feed = zeus_web.feed_live
+        except Exception:
+            pass
+        while True:
+            chunk = piper.stdout.read(4096)
+            if not chunk:
+                break
+            aplay.stdin.write(chunk)
+            raw_chunks.append(chunk)
+            if _feed:
+                _feed(chunk)
+        aplay.stdin.close()
         aplay.wait()
         piper.wait()
         _suppress_until = time.time() + 1.5
+        if sid is not None:
+            try:
+                import zeus_web
+                zeus_web.note_speech_audio(sid, b"".join(raw_chunks))
+            except Exception:
+                pass
     except Exception as e:
         print("TTS error:", e)
     finally:
@@ -1588,6 +1624,57 @@ def generate_music_wav():
 
 def play_music():
     subprocess.run(["aplay", "-D", "robothat", MUSIC_WAV], check=False)
+
+
+MUSIC_DIR = "/home/pi/music"
+
+
+def intercom_play(wav):
+    """Play a phone-uploaded voice clip through the robot's speaker."""
+    global _suppress_until
+    is_speaking.set()
+    try:
+        subprocess.run(["aplay", "-D", "robothat", "-q", wav], check=False)
+        _suppress_until = time.time() + 1.0
+    finally:
+        is_speaking.clear()
+
+
+def zero_servos():
+    """All 12 servos to 0° (calibration/assembly pose)."""
+    if not MOVEMENT_ENABLED:
+        print("[no-move] zero_servos skipped")
+        return
+    action_in_progress.set()
+    try:
+        crawler.set_angle([[0, 0, 0]] * 4, speed=60)
+    finally:
+        action_in_progress.clear()
+
+
+def dance_party():
+    """Play a random downloaded song and dance until it ends."""
+    songs = [os.path.join(MUSIC_DIR, f) for f in sorted(os.listdir(MUSIC_DIR))
+             if f.endswith(".wav")] if os.path.isdir(MUSIC_DIR) else []
+    if not songs:
+        speak("I have no songs to dance to yet.")
+        return
+    song = random.choice(songs)
+    print("Dance party:", os.path.basename(song))
+    action_in_progress.set()   # yield face tracking to the dance
+    proc = subprocess.Popen(["aplay", "-D", "robothat", "-q", song],
+                            stderr=subprocess.DEVNULL)
+    moves = [sway, bob, crouch_rise,
+             lambda: nod(crawler), lambda: shake_head(crawler)]
+    if MOVEMENT_ENABLED:
+        try:
+            while proc.poll() is None:
+                random.choice(moves)()
+                time.sleep(0.1)
+        finally:
+            action_in_progress.clear()
+    proc.wait()
+    action_in_progress.clear()
 
 
 # ── Smooth animation helpers ──────────────────────────────────────────────────
@@ -2023,12 +2110,20 @@ def main():
     try:
         import zeus_web
         zeus_web.start(handle_command, run_actions, sorted(ACTION_MAP.keys()),
-                       get_frame=lambda: Vilib.flask_img)
+                       get_frame=lambda: Vilib.flask_img,
+                       transcribe=whisper_transcribe,
+                       zero_servos=zero_servos,
+                       call_mode=call_mode,
+                       intercom_play=intercom_play)
         print("Web UI: http://0.0.0.0:8080")
     except Exception as e:
         print("Web UI failed to start:", e)
 
-    sample_rate = 44100
+    # 16 kHz is what vosk-model-small-en-us natively expects: ~2.7x less audio
+    # to decode than 44100 (the old rate pegged a full core and starved the
+    # LLM), and better wake-word accuracy. plughw resamples in ALSA (the mic
+    # only does 44.1k/48k natively).
+    sample_rate = 16000
     rec = vosk.KaldiRecognizer(vosk_model, sample_rate)
     awake = False
     arec  = None
@@ -2037,7 +2132,7 @@ def main():
 
     def start_arecord():
         return subprocess.Popen(
-            ["arecord", "-D", "hw:3,0", "-f", "S16_LE",
+            ["arecord", "-D", "plughw:3,0", "-f", "S16_LE",
              "-r", str(sample_rate), "-c", "1", "-q"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
@@ -2056,6 +2151,18 @@ def main():
     try:
         arec = start_arecord()
         while True:
+            # Intercom call (web app) needs the mic exclusively — the USB mic
+            # has a single capture subdevice. Yield it, then resume fresh.
+            if call_mode.is_set():
+                kill_arecord(arec)
+                print("Mic yielded to intercom call")
+                while call_mode.is_set():
+                    time.sleep(0.3)
+                arec = start_arecord()
+                rec  = vosk.KaldiRecognizer(vosk_model, sample_rate)
+                print("Intercom ended — listening for wake word")
+                continue
+
             # Flush stale buffer after going to sleep (curl takes ~8 s of audio)
             if _reset_mic.is_set():
                 _reset_mic.clear()
