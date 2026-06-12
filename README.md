@@ -1,4 +1,4 @@
-# Zeus — an AI spider robot that actually listens
+# Zeus — an AI spider robot that actually listens unlike my ex...
 
 Zeus is what happens when you give a [SunFounder PiCrawler](https://www.sunfounder.com/products/picrawler-kit) — a four-legged "spider" robot running on a Raspberry Pi 5 — a voice, ears, and enough of a brain to hold a short conversation. The whole thing runs on the Pi itself, no cloud needed. You say a wake word, ask it something, and it answers out loud while acting it out: walking around, waving, doing push-ups, tilting its head like it understood you (it usually did).
 
