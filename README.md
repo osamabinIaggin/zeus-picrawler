@@ -8,11 +8,14 @@ Quick heads up before you dig in: the hardware libraries (`picrawler`, `robot_ha
 
 ## See it
 
-Demo clips are on the way — waving, push-ups, and the slightly-too-attentive face-tracking head swivel. They'll live in [`media/`](media/), which already has a two-command guide for pulling footage off the Pi and turning it into a GIF.
+| | |
+|---|---|
+| ![Zeus, front view](media/zeus_front.jpg) | ![Zeus, top-down view](media/zeus_top.jpg) |
+| ![Zeus standing up](media/zeus_stand.gif) | ![Zeus wiggling](media/zeus_wiggle.gif) |
 
-<!-- Once clips are in media/, uncomment and rename: -->
-<!-- ![Zeus waving hello](media/wave.gif) -->
-<!-- ![Push-ups, unprompted](media/pushup.gif) -->
+[Watch the walking gait (mp4, no audio)](media/zeus_walk.mp4)
+
+More demo clips — waving, push-ups, the slightly-too-attentive face-tracking head swivel — are on the way. See [`media/`](media/) for the two-command guide on pulling footage off the Pi and turning it into a GIF.
 
 ## What it actually does
 
